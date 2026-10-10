@@ -1,0 +1,106 @@
+{
+  "dataset": {
+    "total": 9987,
+    "benign": 5005,
+    "phishing": 4982,
+    "image_size": "69x69",
+    "features": 4761
+  },
+  "split": {
+    "train": 7989,
+    "test": 1998
+  },
+  "models": [
+    {
+      "model": "Extra Trees",
+      "accuracy": 0.8208,
+      "precision": 0.8746,
+      "recall": 0.7482,
+      "f1": 0.8065,
+      "roc_auc": 0.9026,
+      "confusion_matrix": [
+        [
+          894,
+          107
+        ],
+        [
+          251,
+          746
+        ]
+      ],
+      "classification_report": {
+        "Benign": {
+          "precision": 0.7807860262008733,
+          "recall": 0.8931068931068931,
+          "f1-score": 0.8331780055917987,
+          "support": 1001.0
+        },
+        "Phishing": {
+          "precision": 0.8745603751465416,
+          "recall": 0.7482447342026078,
+          "f1-score": 0.8064864864864865,
+          "support": 997.0
+        },
+        "accuracy": 0.8208208208208209,
+        "macro avg": {
+          "precision": 0.8276732006737075,
+          "recall": 0.8206758136547505,
+          "f1-score": 0.8198322460391425,
+          "support": 1998.0
+        },
+        "weighted avg": {
+          "precision": 0.8275793324565446,
+          "recall": 0.8208208208208209,
+          "f1-score": 0.8198589642764852,
+          "support": 1998.0
+        }
+      }
+    },
+    {
+      "model": "Random Forest",
+      "accuracy": 0.8128,
+      "precision": 0.8758,
+      "recall": 0.7282,
+      "f1": 0.7952,
+      "roc_auc": 0.8981,
+      "confusion_matrix": [
+        [
+          898,
+          103
+        ],
+        [
+          271,
+          726
+        ]
+      ],
+      "classification_report": {
+        "Benign": {
+          "precision": 0.7681779298545766,
+          "recall": 0.8971028971028971,
+          "f1-score": 0.8276497695852535,
+          "support": 1001.0
+        },
+        "Phishing": {
+          "precision": 0.8757539203860072,
+          "recall": 0.728184553660983,
+          "f1-score": 0.7951807228915663,
+          "support": 997.0
+        },
+        "accuracy": 0.8128128128128128,
+        "macro avg": {
+          "precision": 0.8219659251202919,
+          "recall": 0.8126437253819401,
+          "f1-score": 0.8114152462384099,
+          "support": 1998.0
+        },
+        "weighted avg": {
+          "precision": 0.8218582414460861,
+          "recall": 0.8128128128128128,
+          "f1-score": 0.8114477477866517,
+          "support": 1998.0
+        }
+      }
+    }
+  ],
+  "selected_model": "Extra Trees"
+}
