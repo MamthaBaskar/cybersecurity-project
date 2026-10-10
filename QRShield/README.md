@@ -1,8 +1,8 @@
 # QRShield — Explainable Pre-Navigation QR Code Phishing Detection
 
-QRShield analyzes QR code destinations **before** you visit them, using machine learning and static URL analysis to detect phishing.
+QRShield analyzes QR code destinations **before** you visit them, using machine learning and static URL feature extraction to detect phishing and quishing threats.
 
-> **Security guarantee:** QRShield never visits, fetches, or opens the decoded URL during analysis.
+> **Security guarantee:** QRShield operates strictly pre-navigation. It decodes QR payloads locally and analyzes URL strings statically — no external HTTP requests or redirects are ever performed during analysis.
 
 ---
 
@@ -10,166 +10,103 @@ QRShield analyzes QR code destinations **before** you visit them, using machine 
 
 ```
 QRShield/
-├── frontend/          HTML, CSS, JS — single-page web interface
-├── backend/           FastAPI app, QR decoder, risk engine
-│   ├── main.py        API server
-│   ├── qr_decoder.py  QR decoding (pyzbar + OpenCV fallback)
-│   ├── risk_engine.py Rule-based threat scoring and explanations
-│   └── url_features.py  30 static URL lexical features
+├── frontend/          Clean single-page interface (Scanner, Threat Report, Model Performance)
+│   └── index.html
+├── backend/           FastAPI app, local QR decoder, hardened upload validation, risk engine
+│   ├── main.py        FastAPI API server (restricted CORS to localhost)
+│   ├── qr_decoder.py  Local QR decoder (pyzbar + OpenCV fallback)
+│   ├── risk_engine.py Explainable threat scoring & guidance engine
+│   └── url_features.py  30 static lexical URL feature extractors
 ├── training/
-│   ├── url_features.py   Feature extraction (same as backend)
-│   ├── train_url_model.py  Train Extra Trees & Random Forest on URL data
-│   └── train_image_model.py  Train on QR image pixel data
-├── datasets/          Labelled URL CSV, dataset documentation
-├── models/            Saved models (url_model.pkl, image_model.pkl, ...)
-├── results/           Metrics JSON, confusion matrices, ROC curves, charts
-├── test_qrshield.py   Integration and unit tests
-└── requirements.txt
+│   ├── url_features.py   Static feature extractor pipeline (synced with backend)
+│   ├── train_url_model.py  Validation-guided training of Extra Trees & Random Forest
+│   └── train_image_model.py  Training on Quishing QR image pixel features
+├── datasets/          Labelled datasets and provenance documentation
+│   ├── url_dataset.csv
+│   └── dataset_info.md
+├── models/            Saved models and feature pipeline
+│   ├── url_model.pkl         Selected URL classifier (Extra Trees)
+│   ├── extra_trees_url.pkl   Extra Trees candidate
+│   ├── random_forest_url.pkl Random Forest candidate
+│   ├── feature_names.pkl     Ordered 30-feature list
+│   └── image_model.pkl       Selected image classifier
+├── results/           Genuine evaluation metrics, confusion matrices, ROC curves
+├── test_qrshield.py   Automated unit and integration test suite (30 tests)
+├── test_api.py        Live server endpoint verification script
+├── requirements.txt   Python dependencies
+└── README.md
 ```
 
 ---
 
-## Quick Start
+## Quick Start Commands
 
-### 1. Install dependencies
-
+### 1. Install Dependencies
 ```cmd
 cd e:\cybersecurity-project\QRShield
 pip install -r requirements.txt
 ```
 
-> **Note on pyzbar:** On Windows, pyzbar requires the ZBar DLL.  
-> Download `zbar-0.10` from https://zbar.sourceforge.net/  
-> Or install via `conda install -c conda-forge zbar` if using Anaconda.  
-> OpenCV QR detection is used as fallback if pyzbar fails.
-
-### 2. Train the URL model
-
+### 2. Train the URL Model (Validation-Guided Selection & Retraining)
 ```cmd
 python training\train_url_model.py
 ```
+This script:
+- Verifies label mapping (`0 = Legitimate`, `1 = Phishing`).
+- De-biases synthetic artifacts (apex domains, subdomains, benign paths).
+- Splits into 60% Train, 20% Validation, 20% Untouched Test.
+- Evaluates Extra Trees and Random Forest on the Validation set and selects the superior model.
+- Retrains the selected model on Train + Validation combined.
+- Evaluates once on the untouched Test set and saves genuine metrics/charts to `results/`.
 
-This will:
-- Download the PhiUSIIL URL dataset from UCI (if network is available)
-- Fall back to a built-in labeled URL set if network is unavailable
-- Train Extra Trees and Random Forest classifiers
-- Save models to `models/`
-- Save metrics and charts to `results/`
-
-### 3. Train the QR image model (optional but recommended)
-
-```cmd
-python training\train_image_model.py
-```
-
-This uses the existing `QuishingDataset_extracted/` pickle files.
-
-### 4. Run tests
-
+### 3. Run the Automated Test Suites
 ```cmd
 python test_qrshield.py
+python test_api.py
 ```
 
-### 5. Start the web server
-
+### 4. Start the Web Server (Localhost Default)
 ```cmd
 cd backend
-uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+uvicorn main:app --host 127.0.0.1 --port 8000
 ```
-
-Then open: **http://localhost:8000**
-
----
-
-## Datasets
-
-### Dataset A — QR Image Dataset (Quishing)
-| Property | Value |
-|---|---|
-| File | `QuishingDataset_extracted/qr_codes_29.pickle` |
-| Total | 9,987 samples |
-| Benign | 5,005 (label 0) |
-| Phishing | 4,982 (label 1) |
-| Feature | 69×69 pixel images → 4,761 features |
-
-### Dataset B — URL Phishing Dataset
-| Property | Value |
-|---|---|
-| Source | PhiUSIIL (UCI ML Repository, 2023) or built-in URL examples |
-| URL | https://archive.ics.uci.edu/dataset/967/phiusiil+phishing+url+dataset |
-| Features | 30 static lexical URL features (no HTTP requests) |
-| Labels | 0 = legitimate, 1 = phishing |
+Open your browser at: **http://127.0.0.1:8000**
 
 ---
 
-## API Endpoints
+## Datasets & Label Convention
 
-| Method | Path | Description |
-|---|---|---|
-| GET | `/health` | Backend health and model status |
-| GET | `/api/performance` | Saved evaluation metrics and chart paths |
-| POST | `/api/analyze` | Upload QR image file for analysis |
-| POST | `/api/analyze-url` | Analyze a URL string directly |
+| Dataset | Source | Samples | Labels |
+|---|---|---|---|
+| **URL Phishing (PhiUSIIL)** | [UCI ML Repository](https://archive.ics.uci.edu/dataset/967/phiusiil+phishing+url+dataset) (CC BY 4.0) | 70,020 balanced, de-biased samples | **0 = Legitimate**, **1 = Phishing** |
+| **QR Image (Quishing)** | Workspace archive (`QuishingDataset_extracted`) | 9,987 (69×69 px grayscale) | **0 = Benign**, **1 = Phishing** |
 
 ---
 
-## URL Features (30 total)
+## Evaluated Model Performance (Untouched Test Set)
 
-| Feature | Description |
-|---|---|
-| `url_len` | Total URL length |
-| `host_len` | Hostname length |
-| `num_dots`, `num_hyphens`, `num_slashes` | Special character counts |
-| `is_ip` | IP address used instead of domain |
-| `has_https` | HTTPS scheme |
-| `suspicious_tld` | Free/abused TLD (e.g., .tk, .ml, .xyz) |
-| `subdomain_count` | Number of subdomain levels |
-| `host_entropy` | Shannon entropy of hostname |
-| `has_brand_keyword` | Impersonation of PayPal, Amazon, etc. |
-| `has_phishing_keyword` | Keywords: free, prize, verify, etc. |
-| `is_shortener` | Known URL shortener service |
-| `num_at` | @ symbol in URL |
-| ... | 18 more features |
+### URL Classifier (14,004 Untouched Test URLs)
+| Model | Accuracy | Phishing Recall | Precision | F1-Score | False Positive Rate | ROC-AUC |
+|---|---|---|---|---|---|---|
+| **Extra Trees (Selected)** | **93.87%** | **96.23%** | **91.88%** | **0.9401** | **8.50%** | **0.9776** |
+| **Random Forest** | 93.94% | 96.07% | 92.15% | 0.9407 | 8.18% | 0.9843 |
+
+### QR Image Classifier (1,998 Untouched Test Images)
+| Model | Accuracy | Phishing Recall | Precision | F1-Score | ROC-AUC |
+|---|---|---|---|---|---|
+| **Extra Trees (Selected)** | **82.08%** | **74.82%** | **87.46%** | **0.8065** | **0.9026** |
+| **Random Forest** | 81.28% | 72.82% | 87.58% | 0.7952 | 0.8981 |
 
 ---
 
-## Risk Levels
+## Security & Pre-Navigation Protections
 
-| Level | Meaning |
-|---|---|
-| 🟢 SAFE | No indicators found, model confidence low |
-| 🟡 LOW | Minor indicators — still verify source |
-| 🟠 MEDIUM | Several suspicious indicators — proceed with caution |
-| 🔴 HIGH | Strong phishing signals — do not proceed |
-
-> A SAFE result does not guarantee the URL is safe. Always verify the source of QR codes in unexpected or unsolicited contexts.
-
----
-
-## Security Design
-
-- **No URL navigation:** The decoded URL string is analyzed as text only. No HTTP requests are made to the destination.
-- **SSRF prevention:** The backend only processes the URL string; it never fetches external URLs.
-- **File validation:** Uploaded images are validated for type and size before processing.
-- **Model loaded at startup:** The trained model is loaded once and reused; the performance page never retrains.
-- **Privacy:** URLs are not transmitted to third-party services unless explicitly configured.
-
----
-
-## Troubleshooting
-
-**QR code not detected:**
-- Ensure the image is clear, well-lit, and the QR code fills most of the frame
-- Try PNG or JPG format
-- pyzbar needs ZBar DLL on Windows — see Quick Start note
-
-**Model not found error:**
-- Run `python training\train_url_model.py` first
-
-**Backend not reachable:**
-- Ensure `uvicorn` is running: `cd backend && uvicorn main:app --port 8000`
-- Check firewall settings if accessing from another device
-
-**ImportError on startup:**
-- Run `pip install -r requirements.txt` in the QRShield directory
-
+1. **Bare Hostname Normalization**: Inputs like `www.google.com` or `google.com` are normalized to `https://...` for feature extraction. Explicit schemes (`http://...`) are preserved, and any assumed scheme is reported.
+2. **True Brand Impersonation**: Brand names (Google, PayPal, GitHub, etc.) are only flagged when detected on untrusted/spoofed domains or subdomains, preventing false positives on official domains.
+3. **Hardened Upload Validation**:
+   - Streaming 10 MB maximum size enforcement (aborts early on oversized payloads).
+   - Magic bytes verification (JPEG, PNG, GIF, WebP, BMP).
+   - PIL verification and max dimension limits (4096 × 4096 px).
+4. **Missing Model Handling**: If the model is missing or fails, QRShield returns `UNKNOWN` / `INSUFFICIENT EVIDENCE` — never defaulting to `SAFE`.
+5. **Separated Confidence & Probability**: Reports both calculated $P(\text{Phishing})$ and the model's confidence in its prediction.
+6. **Restricted CORS**: API restricted to `localhost:8000` / `127.0.0.1:8000`.

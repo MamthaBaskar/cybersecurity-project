@@ -301,9 +301,10 @@
           <p id="result-recommendation" style="font-size:.9rem;margin-top:.5rem;font-weight:600"></p>
         </div>
         <div style="text-align:right">
-          <div style="font-size:.8rem;color:var(--clr-muted)">Model Confidence</div>
-          <div id="result-confidence" style="font-size:1.8rem;font-weight:700"></div>
-          <div id="result-prediction" style="font-size:.8rem;color:var(--clr-muted)"></div>
+          <div style="font-size:.8rem;color:var(--clr-muted)">Predicted Class</div>
+          <div id="result-prediction" style="font-size:1.4rem;font-weight:700;color:var(--clr-accent)"></div>
+          <div style="font-size:.8rem;color:var(--clr-muted);margin-top:.3rem">Prediction Confidence: <strong id="result-confidence">—</strong></div>
+          <div style="font-size:.8rem;color:var(--clr-muted)">Phishing Probability: <strong id="result-phishing-prob">—</strong></div>
         </div>
       </div>
     </div>
@@ -312,8 +313,9 @@
     <div class="card">
       <h2>Decoded Destination</h2>
       <div class="url-display" id="result-url"></div>
+      <div id="scheme-assumed-notice" class="alert alert-info hidden" style="padding:.4rem .8rem;font-size:.82rem;margin-bottom:.5rem"></div>
       <p style="font-size:.78rem;color:var(--clr-muted)">
-        ⚠️ This URL is displayed for reference only. QRShield did not open or visit it.
+        ⚠️ This destination was analyzed statically. QRShield did NOT open or visit the destination.
         <span id="result-payload-type"></span>
       </p>
     </div>
@@ -517,10 +519,7 @@ function showResults(d) {
     return;
   }
 
-  if (!d.is_url) {
-    showError(`QR decoded successfully — payload type: ${d.payload_type}.\nContent: ${d.payload}\nThis is not a URL, so phishing analysis does not apply.`);
-    return;
-  }
+
 
   // Risk badge
   const risk = d.risk_level || 'UNKNOWN';
@@ -528,14 +527,27 @@ function showResults(d) {
     `<span class="risk-badge risk-${risk}">${risk} RISK</span>`;
   document.getElementById('result-recommendation').textContent = d.recommendation || '';
 
-  // Confidence
-  const conf = d.model_confidence != null ? (d.model_confidence * 100).toFixed(1) + '%' : 'N/A';
-  document.getElementById('result-confidence').textContent = conf;
-  document.getElementById('result-prediction').textContent = d.model_prediction || '';
+  // Prediction & Separated Probabilities
+  const pred = d.model_prediction || 'Unknown';
+  document.getElementById('result-prediction').textContent = pred;
 
-  // URL
+  const confStr = d.prediction_confidence != null ? (d.prediction_confidence * 100).toFixed(1) + '%' : 'N/A';
+  document.getElementById('result-confidence').textContent = confStr;
+
+  const probStr = d.phishing_probability != null ? (d.phishing_probability * 100).toFixed(1) + '%' : 'N/A';
+  document.getElementById('result-phishing-prob').textContent = probStr;
+
+  // URL & Assumed Scheme notice
   document.getElementById('result-url').textContent = d.url || d.payload;
   document.getElementById('result-payload-type').textContent = `Decoded via: ${d.decode_method || 'direct input'} · Type: ${d.payload_type || 'URL'}`;
+
+  const schemeNotice = document.getElementById('scheme-assumed-notice');
+  if (d.scheme_assumed) {
+    schemeNotice.textContent = `ℹ️ Input was entered without a scheme. Assumed default scheme '${d.assumed_scheme}://' for pre-navigation analysis.`;
+    schemeNotice.classList.remove('hidden');
+  } else {
+    schemeNotice.classList.add('hidden');
+  }
 
   // Explanation
   document.getElementById('result-explanation').innerHTML =
@@ -602,15 +614,21 @@ function renderPerformance() {
   const um = perfData.url_model;
   if (um && !um.error) {
     const ds = um.dataset || {};
+    const totalCount = ds.total_samples || ds.total || '—';
+    const legitCount = ds.legitimate_count || ds.legitimate || '—';
+    const phishCount = ds.phishing_count || ds.phishing || '—';
+    const featCount  = ds.feature_count || ds.features || '—';
+
     document.getElementById('url-dataset-info').innerHTML = `
-      <strong>${ds.total || '—'}</strong> URLs &nbsp;·&nbsp;
-      Legitimate: <strong>${ds.legitimate || '—'}</strong> &nbsp;·&nbsp;
-      Phishing: <strong>${ds.phishing || '—'}</strong> &nbsp;·&nbsp;
-      Features: <strong>${ds.features || '—'}</strong>
+      <strong>${totalCount}</strong> URLs &nbsp;·&nbsp;
+      Legitimate: <strong>${legitCount}</strong> &nbsp;·&nbsp;
+      Phishing: <strong>${phishCount}</strong> &nbsp;·&nbsp;
+      Features: <strong>${featCount}</strong> &nbsp;·&nbsp;
+      Source: <em>${ds.source || 'UCI PhiUSIIL'}</em>
     `;
     document.getElementById('url-selected-model').textContent = um.selected_model || '—';
 
-    const models = um.models || [];
+    const models = um.test_metrics || um.models || [];
     const et = models.find(m => m.model === 'Extra Trees') || {};
     const rf = models.find(m => m.model === 'Random Forest') || {};
     document.getElementById('url-metrics-et').innerHTML = metricsHTML(et);

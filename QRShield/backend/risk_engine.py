@@ -1,113 +1,112 @@
 """
 risk_engine.py
 ==============
-Rule-based risk assessment and SHAP-lite explanation engine for QRShield.
-Produces a structured threat report from URL features and model output.
+Explainable Rule-Based Threat Scoring and Guidance Engine for QRShield.
+Combines 30 static URL features with machine-learning model probabilities.
+Provides transparent indicators, consequences, and actionable safeguards.
 """
 
-import re
-from urllib.parse import urlparse
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
+import tldextract
 
-# ── Severity weights ──────────────────────────────────────────────────────────
+_tld_extractor = tldextract.TLDExtract(cache_dir=None)
+
+# Predefined heuristic threat rules
+# (feature_key, condition_or_threshold, display_label, severity_level)
 RULES = [
-    # (key_in_features, threshold_or_exact, indicator_label, severity)
-    # severity: 'critical', 'high', 'medium', 'low'
-    ('is_ip',             1,    'IP address used instead of domain name',      'high'),
-    ('suspicious_tld',    1,    'Suspicious top-level domain',                  'high'),
-    ('num_at',            1,    '@ symbol in URL (potential URL spoofing)',      'high'),
-    ('is_shortener',      1,    'URL shortener used (hides real destination)',   'high'),
-    ('has_brand_keyword', 1,    'Impersonates a known brand',                   'high'),
-    ('has_phishing_keyword', 1, 'Contains known phishing keyword',             'medium'),
-    ('deep_subdomain',    1,    'Deeply nested subdomains (≥4 levels)',         'medium'),
-    ('has_double_slash',  1,    'Double slash in URL path',                     'medium'),
-    ('has_hex',           1,    'Hex-encoded characters in URL',                'medium'),
-    ('has_port',          1,    'Non-standard port in URL',                     'medium'),
-    ('num_hyphens', lambda v: v >= 3, '3+ hyphens in URL',                     'low'),
-    ('url_len',     lambda v: v > 100, 'Unusually long URL (>100 chars)',       'low'),
-    ('subdomain_count', lambda v: v >= 3, '3+ subdomains',                     'low'),
-    ('query_param_count', lambda v: v >= 5, '5+ query parameters',             'low'),
-    ('digit_ratio',  lambda v: v > 0.3, 'High digit-to-character ratio',       'low'),
-    ('host_entropy', lambda v: v > 4.0, 'High hostname entropy (random-looking)', 'medium'),
-    ('num_percent',  lambda v: v >= 3, '3+ percent-encoded characters',        'low'),
+    ('is_ip',               1,    'IP address used instead of domain name',          'high'),
+    ('suspicious_tld',      1,    'Suspicious/disposable top-level domain',          'high'),
+    ('num_at',              lambda v: v >= 1, '@ symbol in URL (potential URL spoofing)',      'high'),
+    ('brand_impersonation', 1,    'Impersonates a known brand on an untrusted domain','high'),
+    ('is_shortener',        1,    'URL shortener used (obscures true destination)',  'medium'),
+    ('has_phishing_keyword',1,    'Contains lure/phishing promotional keyword',      'medium'),
+    ('deep_subdomain',      1,    'Deeply nested subdomains (≥2 levels beyond www)', 'medium'),
+    ('has_double_slash',    1,    'Double slash in path (redirect evasion pattern)', 'medium'),
+    ('has_hex',             1,    'Hex-encoded characters in URL',                   'low'),
+    ('has_port',            1,    'Non-standard port specified in URL',              'low'),
+    ('num_hyphens', lambda v: v >= 3, 'Excessive hyphens in URL (≥3)',               'low'),
+    ('url_len',     lambda v: v > 90, 'Unusually long URL (>90 characters)',         'low'),
+    ('subdomain_count', lambda v: v >= 2, 'Multiple subdomain levels',               'low'),
+    ('query_param_count', lambda v: v >= 4, 'Multiple query parameters (≥4)',        'low'),
+    ('digit_ratio',  lambda v: v > 0.25, 'High digit-to-character ratio (>25%)',     'low'),
+    ('host_entropy', lambda v: v > 4.2, 'High hostname entropy (algorithmically generated)', 'medium'),
+    ('num_percent',  lambda v: v >= 3, 'Multiple percent-encoded characters (≥3)',   'low'),
 ]
 
 SEVERITY_SCORE = {'critical': 40, 'high': 20, 'medium': 8, 'low': 3}
+
 CONSEQUENCE_MAP = {
-    'Impersonates a known brand':                 'Credential theft and account takeover.',
-    'IP address used instead of domain name':     'Likely a temporary phishing server.',
-    'URL shortener used (hides real destination)':'Destination is hidden; may redirect to malware.',
-    '@ symbol in URL (potential URL spoofing)':   'Browser may navigate to a different site than displayed.',
-    'Suspicious top-level domain':                'Domain registered on a free or abused TLD, common in phishing campaigns.',
-    'Contains known phishing keyword':            'May solicit sensitive personal or financial data.',
-    'Deeply nested subdomains (≥4 levels)':       'Designed to mimic legitimate domain structure.',
-    'High hostname entropy (random-looking)':     'Domain may be algorithmically generated.',
-    'Unusually long URL (>100 chars)':            'Long URLs are used to bury the actual destination.',
+    'Impersonates a known brand on an untrusted domain':
+        'High risk of credential theft, session hijacking, or account takeover by spoofing a familiar service.',
+    'IP address used instead of domain name':
+        'Direct connection to an unverified server, commonly used for temporary or bulletproof phishing hosts.',
+    'URL shortener used (obscures true destination)':
+        'True destination is hidden; may lead through redirection chains to malicious landing pages or drive-by downloads.',
+    '@ symbol in URL (potential URL spoofing)':
+        'Browser may treat text before @ as authentication credentials and navigate to a completely different destination.',
+    'Suspicious/disposable top-level domain':
+        'Domain registered on a low-cost or abused TLD with minimal anti-abuse enforcement, frequent in automated phishing campaigns.',
+    'Contains lure/phishing promotional keyword':
+        'Social engineering tactic attempting to induce urgency or exploit financial incentives (e.g. fake prizes, airdrops).',
+    'Deeply nested subdomains (≥2 levels beyond www)':
+        'Designed to visually mimic legitimate institutional or brand hierarchy on mobile and QR scanner screens.',
+    'High hostname entropy (algorithmically generated)':
+        'Domain appears randomly generated (DGA), characteristic of evasive botnet or malware C2 infrastructure.',
+    'Unusually long URL (>90 characters)':
+        'Overly complex URL structured to conceal the true landing destination on small display interfaces.',
 }
 
 SAFEGUARD_MAP = {
     'critical': [
-        'Do NOT proceed to this URL.',
-        'Report the QR code to your IT/security team.',
-        'If you have already visited the URL, change passwords immediately and check for malware.',
+        'DO NOT proceed to this destination.',
+        'Do not scan or share this QR code with others.',
+        'Report this QR code to your organization or IT security team immediately.',
     ],
     'high': [
-        'Verify the URL with a trusted source before proceeding.',
-        'Do not enter any credentials, payment or personal information.',
-        'Use VirusTotal or Google Safe Browsing to manually check the URL.',
+        'DO NOT enter passwords, credit cards, or two-factor authentication codes.',
+        'Verify the destination URL independently using an official browser bookmark or search engine.',
+        'Check the domain name character by character for typosquatting or look-alike characters.',
     ],
     'medium': [
-        'Exercise caution — one or more suspicious indicators detected.',
-        'Confirm the sender or source of the QR code before scanning.',
-        'Avoid downloading files from this URL.',
+        'Exercise caution before proceeding.',
+        'Verify whether the QR code was placed in a publicly accessible or untrusted physical location.',
+        'Refrain from downloading executable files or accepting profile installations.',
     ],
     'low': [
-        'URL appears mostly safe but verify the source before proceeding.',
-        'Check the full URL carefully for typos or look-alike characters.',
+        'Destination presents low surface threat indicators.',
+        'Always check that the address bar displays a valid SSL certificate before authenticating.',
     ],
 }
 
+# Small, documented list of globally recognized apex domains
+# Used to calibrate borderline model noise ONLY when NO threat indicators are present
+DOCUMENTED_TOP_DOMAINS = {
+    'google.com', 'wikipedia.org', 'github.com', 'microsoft.com',
+    'apple.com', 'amazon.com', 'python.org', 'w3.org', 'nist.gov',
+    'who.int', 'mozilla.org', 'kernel.org', 'stackoverflow.com',
+    'cloudflare.com', 'archive.org'
+}
 
-def assess_risk(features: Dict[str, Any], model_prob: float, model_label: int) -> Dict:
+
+def assess_risk(
+    features: Dict[str, Any],
+    model_prob: Optional[float],
+    model_label: Optional[int],
+    model_available: bool = True,
+    url_str: str = ""
+) -> Dict[str, Any]:
     """
-    Combine rule-based indicators with model output to produce a risk report.
-
-    Parameters
-    ----------
-    features   : output of extract_url_features()
-    model_prob : probability of phishing (0..1) from trained model
-    model_label: model prediction (0=legit, 1=phishing)
-
-    Returns
-    -------
-    dict with keys: risk_level, risk_score, indicators, consequences,
-                    safeguards, recommendation, model_confidence
+    Produce explainable risk assessment.
+    Separates phishing probability from prediction confidence.
+    Returns UNKNOWN when model is unavailable or evidence is ambiguous.
     """
-    triggered: List[Dict] = []
+    triggered: List[Dict[str, Any]] = []
     rule_score = 0
 
     for entry in RULES:
         feat_key, condition, label, severity = entry
         val = features.get(feat_key, 0)
-        if feat_key == 'has_brand_keyword':
-            # Only trigger brand impersonation if accompanied by another anomaly
-            # (e.g. hyphens, deep subdomains, suspicious TLD, phishing keywords, or model prediction 1)
-            # This avoids falsely flagging official domains like google.com or paypal.com
-            is_suspicious_brand = (
-                val == 1 and (
-                    features.get('suspicious_tld', 0) == 1 or
-                    features.get('num_hyphens', 0) > 0 or
-                    features.get('subdomain_count', 0) > 1 or
-                    features.get('has_phishing_keyword', 0) == 1 or
-                    features.get('is_shortener', 0) == 1 or
-                    model_label == 1
-                )
-            )
-            fired = is_suspicious_brand
-        elif callable(condition):
-            fired = condition(val)
-        else:
-            fired = (val == condition)
+        fired = condition(val) if callable(condition) else (val == condition)
         if fired:
             triggered.append({
                 'label':    label,
@@ -116,99 +115,146 @@ def assess_risk(features: Dict[str, Any], model_prob: float, model_label: int) -
             })
             rule_score += SEVERITY_SCORE[severity]
 
-    # Model contribution
-    model_score = 0
-    if model_label == 1:
-        model_score = int(model_prob * 40)   # up to 40 extra points
-    elif model_prob > 0.4:
-        model_score = int((model_prob - 0.4) * 20)
+    # Handle model unavailable / prediction failure
+    if not model_available or model_label is None or model_prob is None:
+        if rule_score >= 20:
+            risk_level = 'HIGH'
+            rec = 'DO NOT PROCEED — Suspicious indicators detected; ML model unavailable for deep analysis.'
+        elif rule_score > 0:
+            risk_level = 'MEDIUM'
+            rec = 'PROCEED WITH CAUTION — Anomalies detected; ML model unavailable.'
+        else:
+            risk_level = 'UNKNOWN'
+            rec = 'ANALYSIS UNAVAILABLE — Model not loaded. Do not assume destination is safe.'
 
+        return {
+            'risk_level':             risk_level,
+            'risk_score':             rule_score,
+            'indicators':             triggered,
+            'consequences':           [CONSEQUENCE_MAP.get(i['label'], 'Uncertain threat potential.') for i in triggered] or ['Analysis incomplete.'],
+            'safeguards':             SAFEGUARD_MAP['high'] if risk_level == 'HIGH' else SAFEGUARD_MAP['medium'],
+            'recommendation':         rec,
+            'model_prediction':       'Unknown',
+            'phishing_probability':   None,
+            'prediction_confidence':  None,
+            'model_note':             'Machine learning model unavailable. Assessment based solely on static heuristic rules.',
+            'trusted_domain_applied': False,
+        }
+
+    # Separate phishing probability and prediction confidence
+    phishing_prob = float(model_prob)
+    if model_label == 1:
+        model_pred_str = 'Phishing'
+        confidence = phishing_prob
+    else:
+        model_pred_str = 'Legitimate'
+        confidence = 1.0 - phishing_prob
+
+    # Model contribution to score
+    model_score = int(phishing_prob * 45)
     total_score = rule_score + model_score
 
-    # ── Risk level ────────────────────────────────────────────────────────────
-    if total_score >= 40 or (model_label == 1 and model_prob >= 0.85):
+    # Check for documented trusted domain calibration
+    ext = _tld_extractor(url_str)
+    registered_domain = f"{ext.domain}.{ext.suffix}".lower() if ext.suffix else ext.domain.lower()
+    is_trusted_domain = registered_domain in DOCUMENTED_TOP_DOMAINS
+    trusted_domain_applied = False
+
+    # Risk level categorization
+    if total_score >= 40 or (model_label == 1 and phishing_prob >= 0.80):
         risk_level = 'HIGH'
-    elif total_score >= 20 or (model_label == 1 and model_prob >= 0.55):
+    elif total_score >= 18 or (model_label == 1 and phishing_prob >= 0.50):
         risk_level = 'MEDIUM'
-    elif total_score >= 8 or model_prob >= 0.35:
+    elif total_score >= 8 or phishing_prob >= 0.30:
         risk_level = 'LOW'
     else:
         risk_level = 'SAFE'
 
-    # If model says phishing with high confidence, floor at MEDIUM
-    if model_label == 1 and model_prob >= 0.60 and risk_level == 'SAFE':
-        risk_level = 'MEDIUM'
+    # If domain is in documented top domains and NO rule-based threat indicators fired:
+    if is_trusted_domain and rule_score == 0:
+        if phishing_prob < 0.60:
+            risk_level = 'SAFE' if phishing_prob < 0.15 else 'LOW'
+            trusted_domain_applied = True
 
-    # ── Consequences ─────────────────────────────────────────────────────────
-    consequences = list({CONSEQUENCE_MAP[i['label']]
-                         for i in triggered if i['label'] in CONSEQUENCE_MAP})
-
-    # ── Safeguards ───────────────────────────────────────────────────────────
+    # Safeguards & recommendation
     if risk_level == 'HIGH':
         safeguards = SAFEGUARD_MAP['high']
-    elif risk_level == 'MEDIUM':
-        safeguards = SAFEGUARD_MAP['medium']
-    elif risk_level == 'LOW':
-        safeguards = SAFEGUARD_MAP['low']
-    else:
-        safeguards = ['URL appears safe. Still verify the source of the QR code before proceeding.']
-
-    # ── Recommendation ───────────────────────────────────────────────────────
-    if risk_level == 'HIGH':
         recommendation = 'DO NOT PROCEED'
     elif risk_level == 'MEDIUM':
+        safeguards = SAFEGUARD_MAP['medium']
         recommendation = 'PROCEED WITH CAUTION — verify independently'
     elif risk_level == 'LOW':
-        recommendation = 'LOW CONCERN — still verify source'
+        safeguards = SAFEGUARD_MAP['low']
+        recommendation = 'LOW CONCERN — verify source before submitting data'
     else:
-        recommendation = 'LIKELY SAFE — verify source of QR code'
+        safeguards = ['URL shows no detected threat indicators. Still exercise standard awareness with physical QR codes.']
+        recommendation = 'LIKELY SAFE'
+
+    consequences = list({
+        CONSEQUENCE_MAP[i['label']]
+        for i in triggered if i['label'] in CONSEQUENCE_MAP
+    })
+    if not consequences:
+        consequences = ['No specific threat patterns identified.']
+
+    # Model note
+    model_note = (
+        'Model outputs are statistical estimates and do not guarantee safety. '
+        'Never enter credentials or download files from untrusted sources.'
+    )
+    if trusted_domain_applied:
+        model_note += f" (Registered domain '{registered_domain}' is a recognized public platform; safety is not guaranteed if account is compromised)."
 
     return {
-        'risk_level':        risk_level,
-        'risk_score':        total_score,
-        'indicators':        triggered,
-        'consequences':      consequences if consequences else ['No specific threat patterns identified.'],
-        'safeguards':        safeguards,
-        'recommendation':    recommendation,
-        'model_prediction':  'Phishing' if model_label == 1 else 'Legitimate',
-        'model_confidence':  round(float(model_prob), 4),
-        'model_note': (
-            'Model probability is an estimate and does not guarantee safety. '
-            'Always verify the source of any QR code.'
-        ),
+        'risk_level':             risk_level,
+        'risk_score':             total_score,
+        'indicators':             triggered,
+        'consequences':           consequences,
+        'safeguards':             safeguards,
+        'recommendation':         recommendation,
+        'model_prediction':       model_pred_str,
+        'phishing_probability':   round(phishing_prob, 4),
+        'prediction_confidence':  round(confidence, 4),
+        'model_note':             model_note,
+        'trusted_domain_applied': trusted_domain_applied,
     }
 
 
-def explain_url(url: str, features: Dict, risk_report: Dict) -> str:
+def explain_url(url: str, features: Dict[str, Any], risk_report: Dict[str, Any]) -> str:
     """
-    Generate a plain-English explanation paragraph for the threat report.
-    Uses only verified indicators — no hallucinated content.
+    Generate transparent, evidence-based threat explanation.
     """
     parts = []
-    risk = risk_report['risk_level']
-    indicators = risk_report['indicators']
+    pred = risk_report.get('model_prediction', 'Unknown')
+    prob = risk_report.get('phishing_probability')
+    conf = risk_report.get('prediction_confidence')
 
-    parts.append(f"This URL was classified as **{risk_report['model_prediction']}** "
-                 f"with {risk_report['model_confidence']*100:.1f}% model confidence.")
-
-    if indicators:
-        high_sev = [i['label'] for i in indicators if i['severity'] in ('critical','high')]
-        med_sev  = [i['label'] for i in indicators if i['severity'] == 'medium']
-        low_sev  = [i['label'] for i in indicators if i['severity'] == 'low']
-
-        if high_sev:
-            parts.append(f"**High-severity indicators detected:** {'; '.join(high_sev)}.")
-        if med_sev:
-            parts.append(f"**Medium-severity indicators:** {'; '.join(med_sev)}.")
-        if low_sev:
-            parts.append(f"**Low-severity indicators:** {'; '.join(low_sev)}.")
+    if prob is not None and conf is not None:
+        parts.append(
+            f"The destination was classified as **{pred}** with "
+            f"**{conf*100:.1f}% confidence** (calculated phishing probability: {prob*100:.1f}%)."
+        )
     else:
-        parts.append("No specific rule-based threat indicators were detected.")
+        parts.append("ML classification was unavailable for this scan.")
 
-    if risk_report['consequences'] and risk_report['consequences'][0] != 'No specific threat patterns identified.':
-        parts.append(f"**Potential consequences:** {' '.join(risk_report['consequences'])}")
+    indicators = risk_report.get('indicators', [])
+    if indicators:
+        high = [i['label'] for i in indicators if i['severity'] in ('critical', 'high')]
+        med  = [i['label'] for i in indicators if i['severity'] == 'medium']
+        low  = [i['label'] for i in indicators if i['severity'] == 'low']
 
-    parts.append(f"**Recommendation:** {risk_report['recommendation']}.")
+        if high:
+            parts.append(f"**High-severity anomalies:** {'; '.join(high)}.")
+        if med:
+            parts.append(f"**Moderate indicators:** {'; '.join(med)}.")
+        if low:
+            parts.append(f"**Low-level indicators:** {'; '.join(low)}.")
+    else:
+        parts.append("No heuristic threat indicators were triggered.")
 
-    return ' '.join(parts)
+    if risk_report.get('trusted_domain_applied'):
+        parts.append("Recognized platform domain confirmed.")
 
+    parts.append(f"**Recommended action:** {risk_report.get('recommendation', 'Verify independently')}.")
+
+    return " ".join(parts)

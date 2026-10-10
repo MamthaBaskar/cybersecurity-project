@@ -1,0 +1,19 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Large raw dataset archives (models are saved in QRShield/models/)
+QuishingDataset.zip
+QuishingDataset_extracted/
+QRShield.zip
+datasets/.tld_cache/
+.tld_cache/
+
+# Environment
+.env
+.venv/
+env/
+venv/
+

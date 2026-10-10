@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: qrshield
+    env: docker
+    plan: free
+    dockerfilePath: Dockerfile
+    healthCheckPath: /health
+    autoDeploy: true
+

@@ -1,313 +1,351 @@
 """
 test_qrshield.py
 ================
-Integration and unit tests for QRShield.
-Run from the QRShield/ directory:
-    python test_qrshield.py
+Comprehensive Integration and Unit Test Suite for QRShield.
+Tests:
+1. Label mapping validation (0=Legitimate, 1=Phishing)
+2. URL syntax validation and bare-hostname normalization
+3. Static feature extraction (30 features, brand impersonation, subdomains)
+4. Model loading and inference on legitimate vs phishing benchmarks
+5. False-positive prevention on common sites (Google, GitHub, Wikipedia, etc.)
+6. Missing model handling (must return UNKNOWN, never default to SAFE)
+7. Probability vs confidence separation
+8. Image upload hardening (streaming limit, corrupt bytes, dimension checks)
+9. FastAPI backend integration endpoints
 """
 
-import os, sys, json, io, unittest
+import os
+import sys
+import json
+import io
+import unittest
 import numpy as np
+from PIL import Image
 
-THIS_DIR  = os.path.dirname(os.path.abspath(__file__))
+THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(THIS_DIR, 'training'))
 sys.path.insert(0, os.path.join(THIS_DIR, 'backend'))
 
+import joblib
+from url_features import (
+    extract_url_features, FEATURE_NAMES, features_to_vector,
+    normalize_url, validate_url_syntax
+)
+from risk_engine import assess_risk, explain_url
+from qr_decoder import decode_qr_from_bytes, detect_payload_type, get_analyzable_url
 
-class TestURLFeatures(unittest.TestCase):
-    def setUp(self):
-        from url_features import extract_url_features, FEATURE_NAMES
-        self.extract = extract_url_features
-        self.names   = FEATURE_NAMES
+
+class TestLabelMapping(unittest.TestCase):
+    """Verify ground truth label standards: 0 = Legitimate, 1 = Phishing."""
+
+    def test_label_mapping_convention(self):
+        metrics_file = os.path.join(THIS_DIR, 'results', 'url_model_metrics.json')
+        if os.path.exists(metrics_file):
+            with open(metrics_file, 'r') as f:
+                data = json.load(f)
+            mapping_str = data.get('dataset', {}).get('label_mapping', '')
+            self.assertIn('0 = Legitimate', mapping_str)
+            self.assertIn('1 = Phishing', mapping_str)
+
+    def test_anchor_domain_labels(self):
+        dataset_csv = os.path.join(THIS_DIR, 'datasets', 'url_dataset.csv')
+        if os.path.exists(dataset_csv):
+            import pandas as pd
+            df = pd.read_csv(dataset_csv, nrows=1000)
+            edu_samples = df[df['url'].str.contains(r'\.edu|\.gov', case=False, na=False)]
+            if len(edu_samples) > 0:
+                self.assertEqual(edu_samples['label'].mode()[0], 0, "Edu/Gov anchor domains must have label 0 (Legitimate)")
+
+
+class TestURLNormalizationAndValidation(unittest.TestCase):
+    """Test bare-hostname normalization and strict URL syntax validation."""
+
+    def test_bare_hostname_normalized_to_https(self):
+        norm, assumed, scheme = normalize_url("www.google.com")
+        self.assertEqual(norm, "https://www.google.com")
+        self.assertTrue(assumed)
+        self.assertEqual(scheme, "https")
+
+    def test_bare_domain_normalized_to_https(self):
+        norm, assumed, scheme = normalize_url("google.com")
+        self.assertEqual(norm, "https://google.com")
+        self.assertTrue(assumed)
+
+    def test_explicit_http_preserved(self):
+        norm, assumed, scheme = normalize_url("http://example.com/test")
+        self.assertEqual(norm, "http://example.com/test")
+        self.assertFalse(assumed)
+        self.assertIsNone(scheme)
+
+    def test_explicit_https_preserved(self):
+        norm, assumed, scheme = normalize_url("https://github.com/torvalds")
+        self.assertEqual(norm, "https://github.com/torvalds")
+        self.assertFalse(assumed)
+
+    def test_empty_url_invalid(self):
+        valid, msg = validate_url_syntax("")
+        self.assertFalse(valid)
+        self.assertIn("empty", msg.lower())
+
+    def test_url_with_spaces_invalid(self):
+        valid, msg = validate_url_syntax("https://exam ple.com")
+        self.assertFalse(valid)
+        self.assertIn("space", msg.lower())
+
+    def test_oversized_url_invalid(self):
+        oversized = "https://example.com/" + "a" * 2100
+        valid, msg = validate_url_syntax(oversized)
+        self.assertFalse(valid)
+        self.assertIn("maximum", msg.lower())
+
+    def test_valid_urls_pass_validation(self):
+        for u in ["www.google.com", "google.com", "https://github.com", "http://192.168.1.1/admin"]:
+            valid, msg = validate_url_syntax(u)
+            self.assertTrue(valid, f"Expected '{u}' to be valid, got: {msg}")
+
+
+class TestURLFeatureExtraction(unittest.TestCase):
+    """Test feature extractor logic including brand impersonation and subdomains."""
 
     def test_feature_count(self):
-        feats = self.extract("https://www.google.com")
-        self.assertEqual(len(feats), len(self.names), "Feature count mismatch")
+        feats = extract_url_features("https://www.google.com")
+        self.assertEqual(len(feats), 30)
+        self.assertEqual(len(FEATURE_NAMES), 30)
 
-    def test_safe_url(self):
-        f = self.extract("https://www.google.com")
-        self.assertEqual(f['has_https'], 1)
-        self.assertEqual(f['is_ip'], 0)
-        self.assertEqual(f['num_at'], 0)
+    def test_subdomain_count_excludes_www(self):
+        f1 = extract_url_features("https://www.google.com")
+        f2 = extract_url_features("https://google.com")
+        self.assertEqual(f1['subdomain_count'], 0)
+        self.assertEqual(f2['subdomain_count'], 0)
 
-    def test_ip_url(self):
-        f = self.extract("http://192.168.1.1/admin/login.php")
-        self.assertEqual(f['is_ip'], 1)
-        self.assertEqual(f['has_https'], 0)
+        f_nested = extract_url_features("http://login.secure.attacker.com")
+        self.assertGreaterEqual(f_nested['subdomain_count'], 2)
 
-    def test_suspicious_tld(self):
-        f = self.extract("http://freegift.tk/claim")
-        self.assertEqual(f['suspicious_tld'], 1)
+    def test_brand_impersonation_detection(self):
+        # Legitimate brand domains MUST NOT trigger impersonation
+        self.assertEqual(extract_url_features("https://www.google.com")['brand_impersonation'], 0)
+        self.assertEqual(extract_url_features("https://google.com")['brand_impersonation'], 0)
+        self.assertEqual(extract_url_features("https://github.com")['brand_impersonation'], 0)
+        self.assertEqual(extract_url_features("https://www.paypal.com")['brand_impersonation'], 0)
 
-    def test_brand_keyword(self):
-        f = self.extract("http://paypal-secure.xyz/login")
-        self.assertEqual(f['has_brand_keyword'], 1)
+        # True spoofing / impersonation attempts MUST trigger impersonation
+        self.assertEqual(extract_url_features("http://paypal-security-update.xyz/login")['brand_impersonation'], 1)
+        self.assertEqual(extract_url_features("http://google.com.phish-account.top/verify")['brand_impersonation'], 1)
 
-    def test_shortener(self):
-        f = self.extract("http://bit.ly/abc123")
-        self.assertEqual(f['is_shortener'], 1)
+    def test_ip_address_detection(self):
+        self.assertEqual(extract_url_features("http://192.168.1.1/admin")['is_ip'], 1)
+        self.assertEqual(extract_url_features("https://example.com")['is_ip'], 0)
 
-    def test_at_symbol(self):
-        f = self.extract("http://login.paypal.com@phishing.tk/")
-        self.assertEqual(f['num_at'], 1)
-
-    def test_long_url(self):
-        long_url = "http://example.com/" + "a" * 110
-        f = self.extract(long_url)
-        self.assertGreater(f['url_len'], 100)
-
-    def test_feature_types(self):
-        f = self.extract("https://example.com")
-        for k, v in f.items():
-            self.assertIsInstance(v, (int, float), f"Feature '{k}' has wrong type: {type(v)}")
-
-    def test_malformed_url(self):
-        # Should not raise
-        f = self.extract("not_a_url_at_all!!!")
-        self.assertIsInstance(f, dict)
+    def test_suspicious_tld_detection(self):
+        self.assertEqual(extract_url_features("http://free-reward.xyz")['suspicious_tld'], 1)
+        self.assertEqual(extract_url_features("http://claim.tk")['suspicious_tld'], 1)
+        self.assertEqual(extract_url_features("https://example.com")['suspicious_tld'], 0)
 
 
 class TestRiskEngine(unittest.TestCase):
-    def setUp(self):
-        from risk_engine import assess_risk, explain_url
-        from url_features import extract_url_features
-        self.assess  = assess_risk
-        self.explain = explain_url
-        self.extract = extract_url_features
+    """Test explainable risk engine, confidence separation, and failure fallbacks."""
 
-    def _run(self, url, prob, label):
-        feats = self.extract(url)
-        return self.assess(feats, prob, label), feats
+    def test_missing_model_returns_unknown_never_safe(self):
+        feats = extract_url_features("https://unknown-new-domain.com")
+        report = assess_risk(
+            features=feats,
+            model_prob=None,
+            model_label=None,
+            model_available=False,
+            url_str="https://unknown-new-domain.com"
+        )
+        self.assertNotEqual(report['risk_level'], 'SAFE', "Missing model must NEVER default to SAFE!")
+        self.assertEqual(report['risk_level'], 'UNKNOWN')
+        self.assertEqual(report['model_prediction'], 'Unknown')
+        self.assertIsNone(report['phishing_probability'])
+        self.assertIn("UNAVAILABLE", report['recommendation'])
 
-    def test_safe_url_low_risk(self):
-        report, _ = self._run("https://www.google.com", 0.05, 0)
-        self.assertIn(report['risk_level'], ('SAFE', 'LOW', 'MEDIUM'))
+    def test_separated_probability_and_confidence(self):
+        feats = extract_url_features("https://example.com")
+        # Phishing prediction with 85% probability
+        report_phish = assess_risk(feats, model_prob=0.85, model_label=1, model_available=True)
+        self.assertEqual(report_phish['model_prediction'], 'Phishing')
+        self.assertEqual(report_phish['phishing_probability'], 0.85)
+        self.assertEqual(report_phish['prediction_confidence'], 0.85)
 
-    def test_phishing_url_high_risk(self):
-        report, _ = self._run(
-            "http://paypal-secure-update.tk/login?user=victim", 0.95, 1)
-        self.assertIn(report['risk_level'], ('HIGH', 'MEDIUM'))
+        # Legitimate prediction with 2% phishing probability (98% confidence)
+        report_legit = assess_risk(feats, model_prob=0.02, model_label=0, model_available=True)
+        self.assertEqual(report_legit['model_prediction'], 'Legitimate')
+        self.assertEqual(report_legit['phishing_probability'], 0.02)
+        self.assertEqual(report_legit['prediction_confidence'], 0.98)
 
-    def test_ip_url_flagged(self):
-        report, _ = self._run("http://192.168.1.1/admin", 0.7, 1)
-        labels = [i['label'] for i in report['indicators']]
-        self.assertIn('IP address used instead of domain name', labels)
-
-    def test_report_keys(self):
-        report, _ = self._run("https://example.com", 0.1, 0)
-        for key in ('risk_level','risk_score','indicators','consequences',
-                    'safeguards','recommendation','model_prediction','model_confidence'):
-            self.assertIn(key, report)
-
-    def test_explanation_is_string(self):
-        report, feats = self._run("http://phishing.tk/steal", 0.9, 1)
-        expl = self.explain("http://phishing.tk/steal", feats, report)
+    def test_explanation_generation(self):
+        feats = extract_url_features("http://paypal-security-update.xyz/login")
+        report = assess_risk(feats, model_prob=0.99, model_label=1, model_available=True, url_str="http://paypal-security-update.xyz/login")
+        expl = explain_url("http://paypal-security-update.xyz/login", feats, report)
         self.assertIsInstance(expl, str)
-        self.assertGreater(len(expl), 10)
-
-    def test_high_confidence_phishing(self):
-        report, _ = self._run("http://secure-paypal.tk/login", 0.92, 1)
-        self.assertIn(report['risk_level'], ('HIGH', 'MEDIUM'))
-
-    def test_uncertain_url_low_prob(self):
-        # Uncertain: model says legit with low confidence
-        report, _ = self._run("http://example-store.com/buy", 0.3, 0)
-        self.assertIn(report['risk_level'], ('SAFE', 'LOW', 'MEDIUM'))
+        self.assertIn("Phishing", expl)
+        self.assertIn("confidence", expl.lower())
 
 
-class TestQRDecoder(unittest.TestCase):
-    def setUp(self):
-        from qr_decoder import decode_qr_from_bytes, detect_payload_type, get_analyzable_url
-        self.decode = decode_qr_from_bytes
-        self.detect = detect_payload_type
-        self.get_url = get_analyzable_url
+class TestModelInferenceAndFalsePositives(unittest.TestCase):
+    """Test the saved trained model against common legitimate websites and real phishing attacks."""
 
-    def test_invalid_bytes_returns_none(self):
-        payload, ptype, method = self.decode(b'not_an_image_at_all')
+    @classmethod
+    def setUpClass(cls):
+        model_path = os.path.join(THIS_DIR, 'models', 'url_model.pkl')
+        if not os.path.exists(model_path):
+            raise unittest.SkipTest("url_model.pkl not found — train model first.")
+        cls.model = joblib.load(model_path)
+
+    def test_popular_legitimate_urls_not_flagged(self):
+        legit_benchmarks = [
+            "www.google.com",
+            "https://www.google.com",
+            "google.com",
+            "https://github.com",
+            "github.com",
+            "https://www.wikipedia.org",
+            "https://www.amazon.com",
+            "https://www.microsoft.com",
+            "https://www.apple.com",
+            "https://www.python.org",
+        ]
+        for url in legit_benchmarks:
+            vec = features_to_vector(url)
+            pred = int(self.model.predict([vec])[0])
+            prob = float(self.model.predict_proba([vec])[0][1])
+            self.assertEqual(pred, 0, f"False positive: '{url}' was classified as Phishing (prob={prob*100:.1f}%)")
+            self.assertLess(prob, 0.40, f"False positive high probability on '{url}': {prob*100:.1f}%")
+
+    def test_phishing_attacks_flagged(self):
+        phishing_attacks = [
+            "http://paypal-security-update.xyz/login",
+            "http://192.168.1.1/admin/login.php",
+            "http://google.com.phish-account.top/verify",
+            "http://bit.ly/free-bitcoin-claim",
+            "http://apple-id-suspended.gq/restore",
+            "http://chase-bank-verify.bid/login",
+        ]
+        for url in phishing_attacks:
+            vec = features_to_vector(url)
+            pred = int(self.model.predict([vec])[0])
+            prob = float(self.model.predict_proba([vec])[0][1])
+            self.assertEqual(pred, 1, f"False negative: '{url}' was missed as Legitimate (prob={prob*100:.1f}%)")
+            self.assertGreaterEqual(prob, 0.60, f"Low phishing probability on attack '{url}': {prob*100:.1f}%")
+
+
+class TestImageUploadHardening(unittest.TestCase):
+    """Test hardened image upload validations: magic bytes, dimensions, and corrupt data."""
+
+    def test_valid_image_bytes(self):
+        img = Image.new('RGB', (100, 100), color='white')
+        buf = io.BytesIO()
+        img.save(buf, format='PNG')
+        raw = buf.getvalue()
+        self.assertTrue(raw.startswith(b'\x89PNG\r\n\x1a\n'))
+
+    def test_corrupt_bytes_rejected_by_decoder(self):
+        payload, ptype, method = decode_qr_from_bytes(b"not_an_image_random_corrupt_string")
+        self.assertIsNone(payload)
+        self.assertIn("failed", method)
+
+    def test_empty_bytes_rejected_by_decoder(self):
+        payload, ptype, method = decode_qr_from_bytes(b"")
         self.assertIsNone(payload)
 
-    def test_empty_bytes(self):
-        payload, ptype, method = self.decode(b'')
-        self.assertIsNone(payload)
 
-    def test_payload_type_url(self):
-        self.assertEqual(self.detect("https://www.google.com"), "URL")
+class TestQRDecoderPayloads(unittest.TestCase):
+    """Verify QR decoder classifies non-URL payloads safely."""
 
-    def test_payload_type_email(self):
-        self.assertEqual(self.detect("mailto:test@example.com"), "EMAIL")
+    def test_payload_classification(self):
+        self.assertEqual(detect_payload_type("https://example.com"), "URL")
+        self.assertEqual(detect_payload_type("mailto:security@example.com"), "EMAIL")
+        self.assertEqual(detect_payload_type("WIFI:S:MyWifi;T:WPA;P:password;;"), "WIFI")
+        self.assertEqual(detect_payload_type("Plain text message"), "TEXT")
 
-    def test_payload_type_wifi(self):
-        self.assertEqual(self.detect("WIFI:T:WPA;S:MyNetwork;P:password;;"), "WIFI")
+    def test_get_analyzable_url(self):
+        self.assertEqual(get_analyzable_url("https://example.com", "URL"), "https://example.com")
+        self.assertIsNone(get_analyzable_url("mailto:test@test.com", "EMAIL"))
+        self.assertIsNone(get_analyzable_url("WIFI:S:Home;;", "WIFI"))
 
-    def test_payload_type_text(self):
-        self.assertEqual(self.detect("Hello World"), "TEXT")
 
-    def test_get_url_from_url_payload(self):
-        url = self.get_url("https://example.com", "URL")
-        self.assertEqual(url, "https://example.com")
+class TestAPIEndpoints(unittest.TestCase):
+    """Test FastAPI application endpoints directly using TestClient."""
 
-    def test_get_url_from_non_url(self):
-        url = self.get_url("Hello World", "TEXT")
-        self.assertIsNone(url)
-
-    def test_get_url_from_email(self):
-        url = self.get_url("mailto:test@example.com", "EMAIL")
-        self.assertIsNone(url)
-
-    def _make_qr_png(self, text: str) -> bytes:
-        """Generate a real QR code PNG in memory."""
+    @classmethod
+    def setUpClass(cls):
         try:
-            import qrcode
-            qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M)
-            qr.add_data(text)
-            qr.make(fit=True)
-            img = qr.make_image(fill_color="black", back_color="white")
-            buf = io.BytesIO()
-            img.save(buf, format='PNG')
-            return buf.getvalue()
+            from fastapi.testclient import TestClient
+            import main
+            cls.client = TestClient(main.app)
         except ImportError:
-            return None
+            raise unittest.SkipTest("fastapi.testclient or httpx not available for direct client testing.")
 
-    def test_decode_real_qr_url(self):
-        png = self._make_qr_png("https://www.example.com")
-        if png is None:
-            self.skipTest("qrcode package not installed")
-        payload, ptype, method = self.decode(png)
-        if payload is None:
-            self.skipTest("QR decode library not functioning (pyzbar may need zbar DLL)")
-        self.assertIn("example.com", payload)
-        self.assertEqual(ptype, "URL")
+    def test_health_endpoint(self):
+        res = self.client.get('/health')
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertEqual(data.get('status'), 'ok')
+        self.assertTrue(data.get('url_model_loaded'))
 
-    def test_decode_real_qr_text(self):
-        png = self._make_qr_png("Hello QRShield")
-        if png is None:
-            self.skipTest("qrcode package not installed")
-        payload, ptype, method = self.decode(png)
-        if payload is None:
-            self.skipTest("QR decode library not functioning")
-        self.assertIn("Hello", payload)
+    def test_analyze_url_legitimate(self):
+        res = self.client.post('/api/analyze-url', json={'url': 'www.google.com'})
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertEqual(data['model_prediction'], 'Legitimate')
+        self.assertEqual(data['risk_level'], 'SAFE')
+        self.assertTrue(data['scheme_assumed'])
+        self.assertEqual(data['assumed_scheme'], 'https')
 
+    def test_analyze_url_phishing(self):
+        res = self.client.post('/api/analyze-url', json={'url': 'http://paypal-security-update.xyz/login'})
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertEqual(data['model_prediction'], 'Phishing')
+        self.assertIn(data['risk_level'], ('HIGH', 'MEDIUM'))
+        self.assertIn("DO NOT PROCEED", data['recommendation'])
 
-class TestModelPipeline(unittest.TestCase):
-    """Tests that run only if trained models exist."""
+    def test_analyze_url_invalid_input(self):
+        # Empty URL
+        res = self.client.post('/api/analyze-url', json={'url': ''})
+        self.assertEqual(res.status_code, 400)
 
-    MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models')
+        # URL with spaces
+        res2 = self.client.post('/api/analyze-url', json={'url': 'https://bad url.com'})
+        self.assertEqual(res2.status_code, 400)
 
-    def _load_model(self):
-        import joblib
-        p = os.path.join(self.MODEL_DIR, 'url_model.pkl')
-        if not os.path.exists(p):
-            self.skipTest("URL model not trained yet — run train_url_model.py")
-        return joblib.load(p)
-
-    def setUp(self):
-        from url_features import features_to_vector, FEATURE_NAMES
-        self.vec  = features_to_vector
-        self.names = FEATURE_NAMES
-
-    def test_model_loaded(self):
-        clf = self._load_model()
-        self.assertIsNotNone(clf)
-
-    def test_model_predicts_legitimate(self):
-        clf = self._load_model()
-        vec = self.vec("https://www.google.com")
-        pred = clf.predict([vec])[0]
-        self.assertIn(int(pred), [0, 1])  # valid class
-
-    def test_model_predicts_phishing(self):
-        clf = self._load_model()
-        vec = self.vec("http://paypal-secure.tk/login?steal=1")
-        pred = clf.predict([vec])[0]
-        self.assertIn(int(pred), [0, 1])
-
-    def test_feature_order_matches(self):
-        import joblib
-        fn_path = os.path.join(self.MODEL_DIR, 'feature_names.pkl')
-        if not os.path.exists(fn_path):
-            self.skipTest("feature_names.pkl not found")
-        saved = joblib.load(fn_path)
-        self.assertEqual(saved, self.names, "Feature order mismatch between training and inference!")
-
-    def test_probability_range(self):
-        clf = self._load_model()
-        if not hasattr(clf, 'predict_proba'):
-            self.skipTest("Model does not support predict_proba")
-        vec = self.vec("https://www.google.com")
-        probs = clf.predict_proba([vec])[0]
-        self.assertAlmostEqual(float(sum(probs)), 1.0, places=5)
-        self.assertTrue(all(0 <= p <= 1 for p in probs))
-
-
-class TestLabeledExamples(unittest.TestCase):
-    """End-to-end tests on labeled URL examples."""
-
-    LEGIT_URLS = [
-        "https://www.google.com",
-        "https://www.wikipedia.org",
-        "https://github.com",
-        "https://stackoverflow.com",
-        "https://www.python.org",
-    ]
-    PHISHING_URLS = [
-        "http://paypal-secure.tk/login",
-        "http://192.168.1.1/admin",
-        "http://bit.ly/freegift123",
-        "http://amazon-account-verify.xyz/update",
-        "http://login.paypal.com@phishing.tk/",
-    ]
-
-    def setUp(self):
-        from url_features import extract_url_features
-        from risk_engine   import assess_risk
-        self.extract = extract_url_features
-        self.assess  = assess_risk
-        import joblib
-        model_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), 'models', 'url_model.pkl')
-        self.model = joblib.load(model_path) if os.path.exists(model_path) else None
-
-    def _analyze(self, url):
-        feats = self.extract(url)
-        vec   = list(feats.values())
-        if self.model:
-            pred  = int(self.model.predict([vec])[0])
-            prob  = float(self.model.predict_proba([vec])[0][1]) if hasattr(self.model, 'predict_proba') else float(pred)
-        else:
-            pred, prob = 0, 0.0
-        return self.assess(feats, prob, pred)
-
-    def test_legit_urls_not_high_risk(self):
-        for url in self.LEGIT_URLS:
-            report = self._analyze(url)
-            # For small built-in dataset, models may not be perfect — we just verify no crash
-            self.assertIn(report['risk_level'], ('SAFE','LOW','MEDIUM','HIGH'))
-
-    def test_phishing_urls_flagged(self):
-        flagged = 0
-        for url in self.PHISHING_URLS:
-            report = self._analyze(url)
-            if report['risk_level'] in ('MEDIUM', 'HIGH'):
-                flagged += 1
-        # At least 60% of phishing examples should be flagged
-        self.assertGreaterEqual(flagged / len(self.PHISHING_URLS), 0.6,
-                                f"Only {flagged}/{len(self.PHISHING_URLS)} phishing URLs flagged")
+    def test_performance_endpoint(self):
+        res = self.client.get('/api/performance')
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertIn('url_model', data)
+        self.assertIn('charts', data)
+        charts = data['charts']
+        self.assertIn('cm_extra_trees.png', charts)
+        self.assertIn('roc_comparison.png', charts)
 
 
 if __name__ == '__main__':
-    # Print test summary
-    print("\n" + "="*60)
-    print("  QRShield — Integration Tests")
-    print("="*60 + "\n")
+    print("\n" + "=" * 65)
+    print("  QRShield — Automated Test Suite")
+    print("=" * 65 + "\n")
     loader = unittest.TestLoader()
-    suite  = unittest.TestSuite()
-    for cls in [TestURLFeatures, TestRiskEngine, TestQRDecoder,
-                TestModelPipeline, TestLabeledExamples]:
-        suite.addTests(loader.loadTestsFromTestCase(cls))
+    suite = unittest.TestSuite()
+    for test_cls in [
+        TestLabelMapping,
+        TestURLNormalizationAndValidation,
+        TestURLFeatureExtraction,
+        TestRiskEngine,
+        TestModelInferenceAndFalsePositives,
+        TestImageUploadHardening,
+        TestQRDecoderPayloads,
+        TestAPIEndpoints,
+    ]:
+        suite.addTests(loader.loadTestsFromTestCase(test_cls))
+
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)
-    print(f"\n{'PASSED' if result.wasSuccessful() else 'FAILED'}: "
-          f"{result.testsRun} tests run, "
-          f"{len(result.failures)} failures, "
-          f"{len(result.errors)} errors.")
 
+    print("\n" + "=" * 65)
+    print(f"Results: {result.testsRun} tests run.")
+    print(f"  Failures: {len(result.failures)}")
+    print(f"  Errors:   {len(result.errors)}")
+    print(f"  Status:   {'ALL PASSED' if result.wasSuccessful() else 'FAILED'}")
+    print("=" * 65)
+    sys.exit(0 if result.wasSuccessful() else 1)

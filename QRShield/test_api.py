@@ -1,48 +1,94 @@
-import urllib.request, json
+"""
+test_api.py
+===========
+Live integration verification script for QRShield HTTP endpoints.
+Tests running server at http://127.0.0.1:8000.
+"""
 
-# Test 1: Health check
-req = urllib.request.urlopen('http://localhost:8000/health', timeout=5)
-data = json.loads(req.read())
-print('HEALTH CHECK:')
-print(json.dumps(data, indent=2))
+import urllib.request
+import urllib.error
+import json
 
-# Test 2: Analyze phishing URL
-payload = json.dumps({'url': 'http://paypal-secure-update.tk/login'}).encode()
-req2 = urllib.request.Request('http://localhost:8000/api/analyze-url',
-    data=payload, headers={'Content-Type': 'application/json'}, method='POST')
-resp2 = urllib.request.urlopen(req2, timeout=10)
-data2 = json.loads(resp2.read())
-print('\nURL ANALYSIS (phishing):')
-print('  URL:         ', data2['url'])
-print('  Risk Level:  ', data2['risk_level'])
-print('  Prediction:  ', data2['model_prediction'])
-conf2 = data2['model_confidence'] * 100
-print('  Confidence:  ', f'{conf2:.1f}%')
-print('  Indicators:  ', [i['label'] for i in data2['indicators']])
-print('  Recommend:   ', data2['recommendation'])
+BASE_URL = 'http://127.0.0.1:8000'
 
-# Test 3: Analyze safe URL
-payload3 = json.dumps({'url': 'https://www.google.com'}).encode()
-req3 = urllib.request.Request('http://localhost:8000/api/analyze-url',
-    data=payload3, headers={'Content-Type': 'application/json'}, method='POST')
-resp3 = urllib.request.urlopen(req3, timeout=10)
-data3 = json.loads(resp3.read())
-print('\nURL ANALYSIS (safe):')
-print('  URL:        ', data3['url'])
-print('  Risk Level: ', data3['risk_level'])
-print('  Prediction: ', data3['model_prediction'])
-conf3 = data3['model_confidence'] * 100
-print('  Confidence: ', f'{conf3:.1f}%')
+print("=" * 60)
+print("  QRShield Live Server Verification")
+print("=" * 60)
 
-# Test 4: Performance endpoint
-req4 = urllib.request.urlopen('http://localhost:8000/api/performance', timeout=5)
-data4 = json.loads(req4.read())
-print('\nPERFORMANCE ENDPOINT:')
-um = data4.get('url_model', {})
-if 'models' in um:
-    for m in um['models']:
-        auc = m.get('roc_auc', 'N/A')
-        print(f"  {m['model']}: acc={m['accuracy']:.4f} prec={m['precision']:.4f} rec={m['recall']:.4f} f1={m['f1']:.4f} auc={auc}")
-charts = list(data4.get('charts', {}).keys())
-print('  Charts:', charts)
+# 1. Health check
+print("\n[1] Health Check Endpoint (/health):")
+with urllib.request.urlopen(f'{BASE_URL}/health', timeout=5) as resp:
+    data = json.loads(resp.read().decode())
+    print("  Status code:       200 OK")
+    print("  Server status:    ", data.get('status'))
+    print("  URL model loaded: ", data.get('url_model_loaded'))
+    print("  Image model:      ", data.get('image_model_loaded'))
+    print("  Feature count:    ", data.get('feature_count'))
 
+# 2. Benchmark URL tests
+benchmarks = [
+    ("www.google.com", "Legitimate"),
+    ("https://www.google.com", "Legitimate"),
+    ("google.com", "Legitimate"),
+    ("https://github.com", "Legitimate"),
+    ("github.com", "Legitimate"),
+    ("https://www.wikipedia.org", "Legitimate"),
+    ("http://paypal-security-update.xyz/login", "Phishing"),
+    ("http://192.168.1.1/admin/login.php", "Phishing"),
+    ("http://google.com.phish-account.top/verify", "Phishing")
+]
+
+print("\n[2] Direct URL Analysis (/api/analyze-url):")
+print(f"{'URL':40s} Expected    Predicted    Confidence  Prob(Phish)  Risk Level  Status")
+print("-" * 105)
+
+all_passed = True
+for url, expected in benchmarks:
+    payload = json.dumps({'url': url}).encode('utf-8')
+    req = urllib.request.Request(
+        f'{BASE_URL}/api/analyze-url',
+        data=payload,
+        headers={'Content-Type': 'application/json'},
+        method='POST'
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        res = json.loads(resp.read().decode())
+        pred = res.get('model_prediction')
+        conf = res.get('prediction_confidence')
+        prob = res.get('phishing_probability')
+        risk = res.get('risk_level')
+        conf_str = f"{conf*100:.1f}%" if conf is not None else "N/A"
+        prob_str = f"{prob*100:.1f}%" if prob is not None else "N/A"
+        ok = (pred == expected)
+        if not ok:
+            all_passed = False
+        print(f"{url:40s} {expected:11s} {pred:11s}  {conf_str:10s}  {prob_str:11s}  {risk:10s}  {'PASS' if ok else 'FAIL'}")
+
+# 3. Validation rejection
+print("\n[3] URL Syntax Validation Errors:")
+for invalid in ["", "https://bad url.com", "notadomain"]:
+    payload = json.dumps({'url': invalid}).encode('utf-8')
+    req = urllib.request.Request(
+        f'{BASE_URL}/api/analyze-url',
+        data=payload,
+        headers={'Content-Type': 'application/json'},
+        method='POST'
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            print(f"  Unexpected 200 OK on invalid URL: '{invalid}'")
+    except urllib.error.HTTPError as e:
+        print(f"  Correctly rejected '{invalid}' with HTTP {e.code}: {e.read().decode()[:70]}...")
+
+# 4. Performance endpoint
+print("\n[4] Performance Metrics Endpoint (/api/performance):")
+with urllib.request.urlopen(f'{BASE_URL}/api/performance', timeout=5) as resp:
+    perf = json.loads(resp.read().decode())
+    um = perf.get('url_model', {})
+    print("  Selected Model:   ", um.get('selected_model'))
+    print("  Dataset total:    ", um.get('dataset', {}).get('total_samples'))
+    print("  Charts available: ", list(perf.get('charts', {}).keys()))
+
+print("\n" + "=" * 60)
+print(f"  Live Server Verification Result: {'ALL TESTS PASSED' if all_passed else 'FAILURES DETECTED'}")
+print("=" * 60)
