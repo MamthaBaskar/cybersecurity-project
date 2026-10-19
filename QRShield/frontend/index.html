@@ -231,6 +231,13 @@
 
   <div class="card">
     <h2>Upload QR Image</h2>
+    <h3 class="mt-1">Image classifier</h3>
+    <div class="tab-row" id="scanner-image-model-tabs">
+      <button class="tab-btn active" type="button" data-scanner-img-model="extra_trees" onclick="selectImageModel('extra_trees')">Extra Trees</button>
+      <button class="tab-btn" type="button" data-scanner-img-model="random_forest" onclick="selectImageModel('random_forest')">Random Forest</button>
+      <button class="tab-btn" type="button" data-scanner-img-model="improved_cnn" onclick="selectImageModel('improved_cnn')" title="Experimental. Shows a fixed demo label if local inference is unavailable.">Residual CNN</button>
+    </div>
+    <p style="font-size:.8rem;color:var(--clr-muted)">URL analysis for decoded destinations continues independently of the selected image classifier.</p>
 
     <div id="drop-zone" onclick="document.getElementById('file-input').click()">
       <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -307,6 +314,14 @@
           <div style="font-size:.8rem;color:var(--clr-muted)">Phishing Probability: <strong id="result-phishing-prob">—</strong></div>
         </div>
       </div>
+    </div>
+
+    <div class="card hidden" id="image-model-result-card">
+      <h2>QR Image Model Prediction</h2>
+      <div id="image-model-result-name" style="font-size:.85rem;color:var(--clr-muted)"></div>
+      <div id="image-model-experimental" class="hidden" role="status" style="font-size:.82rem;color:var(--clr-muted)"></div>
+      <div>Predicted class: <strong id="image-model-prediction"></strong></div>
+      <div>Prediction confidence: <strong id="image-model-confidence"></strong></div>
     </div>
 
     <!-- URL -->
@@ -396,11 +411,16 @@
     <div class="card">
       <h2>Results</h2>
       <div class="tab-row" id="img-model-tabs">
-        <button class="tab-btn active" onclick="showImgModel('extra_trees')">Extra Trees</button>
-        <button class="tab-btn" onclick="showImgModel('random_forest')">Random Forest</button>
+        <button class="tab-btn active" data-img-model="extra_trees" onclick="showImgModel('extra_trees')">Extra Trees</button>
+        <button class="tab-btn" data-img-model="random_forest" onclick="showImgModel('random_forest')">Random Forest</button>
+        <button class="tab-btn" data-img-model="improved_cnn" onclick="showImgModel('improved_cnn')">Residual CNN</button>
       </div>
       <div id="img-metrics-et" class="metrics-grid"></div>
       <div id="img-metrics-rf" class="metrics-grid hidden"></div>
+      <div id="img-metrics-improved-cnn" class="hidden" role="status" style="color:var(--clr-muted);font-size:.9rem">
+        <strong>Accuracy reported in the training notebook: 78.48%</strong>
+        <p style="margin:.5rem 0 0">This is the notebook's final test result, not a verified measurement of the local model file. The local artifact has not been matched to that evaluation run. When real inference is unavailable, the Scanner displays a clearly marked fixed demo label instead.</p>
+      </div>
     </div>
 
     <div class="card">
@@ -413,6 +433,7 @@
 <!-- ── Scripts ─────────────────────────────────────────────────────── -->
 <script>
 const API = '';   // same origin
+let selectedImageModel = 'extra_trees';
 
 // ── Page routing ────────────────────────────────────────────────────
 function showPage(name) {
@@ -430,10 +451,18 @@ async function checkHealth() {
     const d = await r.json();
     const dot = document.getElementById('status-dot');
     if (d.status === 'ok') {
+      const cnnButton = document.querySelector('[data-scanner-img-model="improved_cnn"]');
+      cnnButton.title = d.cnn_demo_mode
+        ? 'Static demo output only; actual TensorFlow inference is unavailable.'
+        : 'Local Residual CNN inference is experimental.';
       dot.classList.add('online');
-      dot.title = `Backend online | URL model: ${d.url_model_loaded ? '✓' : '✗'} | Image model: ${d.image_model_loaded ? '✓' : '✗'}`;
+      dot.title = `Backend online | URL model: ${d.url_model_loaded ? '✓' : '✗'} | Image models: ${(d.image_models_loaded || []).join(', ') || 'none'} | Residual CNN: ${d.cnn_demo_mode ? 'static demo output' : 'experimental inference'}`;
     }
-  } catch { /* offline */ }
+  } catch {
+    const cnnButton = document.querySelector('[data-scanner-img-model="improved_cnn"]');
+    cnnButton.title = 'Backend health could not be confirmed; prediction requests may fail.';
+    document.getElementById('status-dot').classList.remove('online');
+  }
 }
 checkHealth();
 
@@ -469,6 +498,13 @@ function handleFile(f) {
   hideError();
 }
 
+function selectImageModel(which) {
+  if (!['extra_trees', 'random_forest', 'improved_cnn'].includes(which)) return;
+  selectedImageModel = which;
+  document.querySelectorAll('#scanner-image-model-tabs [data-scanner-img-model]').forEach(button =>
+    button.classList.toggle('active', button.dataset.scannerImgModel === which));
+}
+
 // ── QR Analysis ─────────────────────────────────────────────────────
 async function analyzeQR() {
   if (!selectedFile) return;
@@ -476,6 +512,7 @@ async function analyzeQR() {
   try {
     const fd = new FormData();
     fd.append('file', selectedFile);
+    fd.append('image_model_name', selectedImageModel);
     const r = await fetch(API + '/api/analyze', { method: 'POST', body: fd });
     const d = await r.json();
     if (!r.ok) { showError(d.detail || d.error || 'Analysis failed.'); return; }
@@ -526,6 +563,23 @@ function showResults(d) {
   document.getElementById('risk-badge-wrap').innerHTML =
     `<span class="risk-badge risk-${risk}">${risk} RISK</span>`;
   document.getElementById('result-recommendation').textContent = d.recommendation || '';
+
+  const imageModelCard = document.getElementById('image-model-result-card');
+  if (d.image_model_prediction != null) {
+    document.getElementById('image-model-result-name').textContent =
+      (d.image_model || 'Image model').replaceAll('_', ' ');
+    document.getElementById('image-model-prediction').textContent = d.image_model_prediction;
+    document.getElementById('image-model-confidence').textContent =
+      d.image_model_confidence != null ? (d.image_model_confidence * 100).toFixed(1) + '%' : 'N/A';
+    const experimentalNotice = document.getElementById('image-model-experimental');
+    experimentalNotice.textContent = d.image_model_demo === true
+      ? 'DEMO ONLY — this fixed “Phishing” label does not come from the uploaded image or the CNN model. Confidence is not available.'
+      : 'EXPERIMENTAL — verify this model result independently.';
+    experimentalNotice.classList.toggle('hidden', d.image_model_experimental !== true);
+    imageModelCard.classList.remove('hidden');
+  } else {
+    imageModelCard.classList.add('hidden');
+  }
 
   // Prediction & Separated Probabilities
   const pred = d.model_prediction || 'Unknown';
@@ -714,11 +768,15 @@ function showUrlModel(which) {
     b.classList.toggle('active', i === (which === 'extra_trees' ? 0 : 1)));
 }
 function showImgModel(which) {
-  ['et','rf'].forEach(k => {
-    document.getElementById('img-metrics-'+k).classList.toggle('hidden', k !== (which === 'extra_trees' ? 'et' : 'rf'));
-  });
-  document.querySelectorAll('#img-model-tabs .tab-btn').forEach((b, i) =>
-    b.classList.toggle('active', i === (which === 'extra_trees' ? 0 : 1)));
+  const panels = {
+    extra_trees: 'img-metrics-et',
+    random_forest: 'img-metrics-rf',
+    improved_cnn: 'img-metrics-improved-cnn',
+  };
+  Object.entries(panels).forEach(([model, panelId]) =>
+    document.getElementById(panelId).classList.toggle('hidden', model !== which));
+  document.querySelectorAll('#img-model-tabs .tab-btn').forEach(button =>
+    button.classList.toggle('active', button.dataset.imgModel === which));
 }
 
 // ── Camera ───────────────────────────────────────────────────────────
@@ -764,4 +822,3 @@ function hideError() { document.getElementById('error-msg').classList.add('hidde
 </script>
 </body>
 </html>
-

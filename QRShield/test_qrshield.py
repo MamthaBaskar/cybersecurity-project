@@ -18,7 +18,9 @@ import os
 import sys
 import json
 import io
+import asyncio
 import unittest
+from unittest.mock import AsyncMock, MagicMock, patch
 import numpy as np
 from PIL import Image
 
@@ -250,6 +252,195 @@ class TestImageUploadHardening(unittest.TestCase):
         self.assertIsNone(payload)
 
 
+class TestImageModelInference(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import main
+            cls.main = main
+        except ImportError as e:
+            raise unittest.SkipTest(f"Backend dependencies unavailable: {e}")
+
+    class FakeClassifier:
+        n_features_in_ = 69 * 69
+        classes_ = np.array([0, 1])
+
+        def predict(self, features):
+            return np.array([1])
+
+        def predict_proba(self, features):
+            return np.array([[0.2, 0.8]])
+
+    @staticmethod
+    def make_image_bytes():
+        image = Image.new('L', (69, 69), color=255)
+        buffer = io.BytesIO()
+        image.save(buffer, format='PNG')
+        return buffer.getvalue()
+
+    def test_classical_preprocessing_shape_and_range(self):
+        features = self.main.prepare_classical_image_features(self.make_image_bytes())
+        self.assertEqual(features.shape, (1, 69 * 69))
+        self.assertEqual(features.dtype, np.float32)
+        self.assertEqual(float(features.min()), 1.0)
+        self.assertEqual(float(features.max()), 1.0)
+
+    def test_extra_trees_prediction_and_confidence(self):
+        with patch.dict(self.main.image_models, {'extra_trees': self.FakeClassifier()}):
+            result = self.main.predict_image_model('extra_trees', self.make_image_bytes())
+        self.assertEqual(result['image_model_prediction'], 'Phishing')
+        self.assertEqual(result['image_model_confidence'], 0.8)
+
+    def test_random_forest_prediction_and_confidence(self):
+        with patch.dict(self.main.image_models, {'random_forest': self.FakeClassifier()}):
+            result = self.main.predict_image_model('random_forest', self.make_image_bytes())
+        self.assertEqual(result['image_model_prediction'], 'Phishing')
+        self.assertEqual(result['image_model_confidence'], 0.8)
+
+    def test_cnn_preprocessing_shape_range_and_grayscale(self):
+        image = Image.new('RGB', (138, 276), color=(255, 0, 0))
+        buffer = io.BytesIO()
+        image.save(buffer, format='PNG')
+
+        result = self.main.prepare_cnn_image_input(buffer.getvalue())
+
+        self.assertEqual(result.shape, (1, 69, 69, 1))
+        self.assertEqual(result.dtype, np.float32)
+        self.assertGreaterEqual(float(result.min()), 0.0)
+        self.assertLessEqual(float(result.max()), 1.0)
+        self.assertAlmostEqual(float(result[0, 0, 0, 0]), 0.298, places=2)
+
+    def test_cnn_prediction_uses_notebook_threshold_and_is_experimental(self):
+        class FakeCNN:
+            def __init__(self, score):
+                self.score = score
+                self.inputs = None
+
+            def predict(self, inputs, verbose=0):
+                self.inputs = inputs
+                return np.array([[self.score]], dtype=np.float32)
+
+        phishing_model = FakeCNN(0.05)
+        with patch.object(self.main, 'load_cnn_model', return_value=phishing_model):
+            phishing = self.main.predict_local_cnn(self.make_image_bytes())
+        self.assertEqual(phishing['image_model_prediction'], 'Phishing')
+        self.assertAlmostEqual(phishing['image_model_confidence'], 0.05, places=6)
+        self.assertTrue(phishing['image_model_experimental'])
+        self.assertEqual(phishing['image_model_threshold'], 0.05)
+        self.assertEqual(phishing_model.inputs.shape, (1, 69, 69, 1))
+        self.assertEqual(phishing_model.inputs.dtype, np.float32)
+
+        benign_model = FakeCNN(0.04)
+        with patch.object(self.main, 'load_cnn_model', return_value=benign_model):
+            benign = self.main.predict_local_cnn(self.make_image_bytes())
+        self.assertEqual(benign['image_model_prediction'], 'Benign')
+        self.assertAlmostEqual(benign['image_model_confidence'], 0.96, places=6)
+
+    def test_cnn_demo_output_is_fixed_and_explicitly_not_a_model_prediction(self):
+        first = self.main.predict_cnn_demo()
+        second = self.main.predict_cnn_demo()
+        self.assertEqual(first, second)
+        self.assertEqual(first['image_model_prediction'], 'Phishing')
+        self.assertIsNone(first['image_model_confidence'])
+        self.assertTrue(first['image_model_demo'])
+        self.assertTrue(first['image_model_experimental'])
+
+    def test_cnn_runtime_rejects_incompatible_tensorflow_keras(self):
+        def installed_version(package):
+            return {'tensorflow': '2.15.0', 'keras': '2.15.0'}[package]
+
+        with (
+            patch.object(self.main.metadata, 'version', side_effect=installed_version),
+            patch.object(self.main, 'CNN_LOAD_ERROR', None),
+        ):
+            status = self.main.get_cnn_local_status()
+        self.assertFalse(status['ready'])
+        self.assertIn('tensorflow 2.15.0', status['reason'])
+        self.assertIn('needs 2.20.0', status['reason'])
+
+    def test_cnn_prediction_rejects_invalid_sigmoid_output(self):
+        from fastapi import HTTPException
+
+        class InvalidCNN:
+            def predict(self, inputs, verbose=0):
+                return np.array([[1.2]], dtype=np.float32)
+
+        with (
+            patch.object(self.main, 'load_cnn_model', return_value=InvalidCNN()),
+            self.assertRaises(HTTPException) as error,
+        ):
+            self.main.predict_local_cnn(self.make_image_bytes())
+        self.assertEqual(error.exception.status_code, 500)
+
+    def test_remote_cnn_requires_every_verification_flag(self):
+        settings = {
+            'CNN_REMOTE_ENABLED': True,
+            'CNN_REMOTE_URL': 'https://cnn.example.test',
+            'CNN_REMOTE_TOKEN': 'test-token',
+        }
+        remote_health = {
+            'status': 'ok',
+            'model_loaded': True,
+            'preprocessing_verified': True,
+            'class_mapping_verified': True,
+            'threshold_verified': True,
+            'prediction_ready': False,
+            'reason': 'Inference remains disabled.',
+        }
+        with (
+            patch.multiple(self.main, **settings),
+            patch.object(self.main, '_request_cnn_remote', return_value=remote_health),
+        ):
+            status = asyncio.run(self.main.get_cnn_remote_status())
+        self.assertFalse(status['ready'])
+        self.assertEqual(status['reason'], 'Inference remains disabled.')
+
+    def test_remote_cnn_prediction_returns_only_supported_fields(self):
+        response = {'prediction': 'Phishing', 'confidence': 0.91}
+        with (
+            patch.object(
+                self.main,
+                'get_cnn_remote_status',
+                new=AsyncMock(return_value={'ready': True, 'reason': None}),
+            ),
+            patch.object(self.main, '_request_cnn_remote', return_value=response),
+        ):
+            result = asyncio.run(self.main.predict_remote_cnn(b'validated image'))
+        self.assertEqual(result, {
+            'image_model': 'Residual CNN',
+            'image_model_prediction': 'Phishing',
+            'image_model_confidence': 0.91,
+        })
+
+    def test_remote_request_keeps_token_in_server_side_authorization_header(self):
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = b'{"status":"ok"}'
+        with (
+            patch.object(self.main, 'CNN_REMOTE_URL', 'https://cnn.example.test'),
+            patch.object(self.main, 'CNN_REMOTE_TOKEN', 'test-token'),
+            patch.object(self.main.urllib.request, 'urlopen', return_value=response) as urlopen,
+        ):
+            result = self.main._request_cnn_remote('/health')
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.get_header('Authorization'), 'Bearer test-token')
+        self.assertEqual(result, {'status': 'ok'})
+
+    def test_remote_cnn_rejects_invalid_prediction_shape(self):
+        from fastapi import HTTPException
+
+        with (
+            patch.object(
+                self.main,
+                'get_cnn_remote_status',
+                new=AsyncMock(return_value={'ready': True, 'reason': None}),
+            ),
+            patch.object(self.main, '_request_cnn_remote', return_value=['not', 'a', 'mapping']),
+        ):
+            with self.assertRaises(HTTPException) as error:
+                asyncio.run(self.main.predict_remote_cnn(b'validated image'))
+        self.assertEqual(error.exception.status_code, 502)
+
+
 class TestQRDecoderPayloads(unittest.TestCase):
     """Verify QR decoder classifies non-URL payloads safely."""
 
@@ -265,6 +456,41 @@ class TestQRDecoderPayloads(unittest.TestCase):
         self.assertIsNone(get_analyzable_url("WIFI:S:Home;;", "WIFI"))
 
 
+class TestRemoteCNNServiceScaffold(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from fastapi.testclient import TestClient
+        from cnn_service import main as service
+
+        cls.service = service
+        cls.client = TestClient(service.app)
+
+    def test_health_is_authenticated_and_fails_closed(self):
+        with patch.object(self.service, 'CNN_API_TOKEN', 'test-token'):
+            unauthorized = self.client.get('/health')
+            response = self.client.get('/health', headers={'Authorization': 'Bearer test-token'})
+        self.assertEqual(unauthorized.status_code, 401)
+        self.assertEqual(response.status_code, 200)
+        status = response.json()
+        self.assertFalse(status['model_loaded'])
+        self.assertFalse(status['preprocessing_verified'])
+        self.assertFalse(status['class_mapping_verified'])
+        self.assertFalse(status['threshold_verified'])
+        self.assertFalse(status['prediction_ready'])
+
+    def test_prediction_remains_disabled(self):
+        with patch.object(self.service, 'CNN_API_TOKEN', 'test-token'):
+            response = self.client.post(
+                '/predict',
+                content=b'QR image bytes',
+                headers={
+                    'Authorization': 'Bearer test-token',
+                    'Content-Type': 'application/octet-stream',
+                },
+            )
+        self.assertEqual(response.status_code, 503)
+
+
 class TestAPIEndpoints(unittest.TestCase):
     """Test FastAPI application endpoints directly using TestClient."""
 
@@ -278,11 +504,107 @@ class TestAPIEndpoints(unittest.TestCase):
             raise unittest.SkipTest("fastapi.testclient or httpx not available for direct client testing.")
 
     def test_health_endpoint(self):
+        import main
+
         res = self.client.get('/health')
         self.assertEqual(res.status_code, 200)
         data = res.json()
         self.assertEqual(data.get('status'), 'ok')
         self.assertTrue(data.get('url_model_loaded'))
+        self.assertEqual(data.get('cnn_prediction_enabled'), main.get_cnn_local_status()['ready'])
+        self.assertTrue(data.get('cnn_experimental'))
+
+    def test_analyze_qr_uses_selected_classical_model_and_preserves_url_analysis(self):
+        import main
+
+        raw_bytes = b'test qr image bytes'
+        upload = {'file': ('qr.png', raw_bytes, 'image/png')}
+        for selected_model in ('extra_trees', 'random_forest'):
+            with self.subTest(model=selected_model):
+                with (
+                    patch.object(main, 'validate_and_read_image_stream', new=AsyncMock(return_value=raw_bytes)),
+                    patch.object(main, 'predict_image_model', return_value={
+                        'image_model': selected_model,
+                        'image_model_prediction': 'Phishing',
+                        'image_model_confidence': 0.8,
+                    }) as predict,
+                    patch.object(main, 'decode_qr_from_bytes', return_value=('https://example.com', 'URL', 'opencv')),
+                    patch.object(main, 'get_analyzable_url', return_value='https://example.com'),
+                    patch.object(main, 'run_url_analysis', return_value={
+                        'model_prediction': 'Legitimate',
+                        'prediction_confidence': 0.9,
+                    }),
+                ):
+                    response = self.client.post(
+                        '/api/analyze',
+                        files=upload,
+                        data={'image_model_name': selected_model},
+                    )
+                self.assertEqual(response.status_code, 200)
+                result = response.json()
+                self.assertEqual(result['image_model_prediction'], 'Phishing')
+                self.assertEqual(result['image_model_confidence'], 0.8)
+                self.assertEqual(result['model_prediction'], 'Legitimate')
+                predict.assert_called_once_with(selected_model, raw_bytes)
+
+    def test_analyze_qr_routes_cnn_locally_and_keeps_result_experimental(self):
+        import main
+
+        prediction = {
+            'image_model': 'Residual CNN',
+            'image_model_prediction': 'Phishing',
+            'image_model_confidence': 0.8,
+            'image_model_experimental': True,
+            'image_model_threshold': 0.05,
+        }
+        with (
+            patch.object(main, 'get_cnn_local_status', return_value={'ready': True, 'reason': None}),
+            patch.object(main, 'validate_and_read_image_stream', new=AsyncMock(return_value=b'valid image')),
+            patch.object(main, 'predict_local_cnn', return_value=prediction) as predict,
+            patch.object(main, 'decode_qr_from_bytes', return_value=('https://example.com', 'URL', 'opencv')),
+            patch.object(main, 'get_analyzable_url', return_value='https://example.com'),
+            patch.object(main, 'run_url_analysis', return_value={
+                'model_prediction': 'Legitimate',
+                'prediction_confidence': 0.9,
+            }),
+        ):
+            response = self.client.post(
+                '/api/analyze',
+                files={'file': ('qr.png', b'test qr image bytes', 'image/png')},
+                data={'image_model_name': 'improved_cnn'},
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['image_model_prediction'], 'Phishing')
+        self.assertTrue(response.json()['image_model_experimental'])
+        predict.assert_called_once_with(b'valid image')
+
+    def test_analyze_qr_returns_fixed_cnn_demo_if_local_runtime_is_incompatible(self):
+        import main
+
+        with (
+            patch.object(
+                main,
+                'get_cnn_local_status',
+                return_value={'ready': False, 'reason': 'TensorFlow 2.20.0 and Keras 3.13.2 are required.'},
+            ),
+            patch.object(main, 'validate_and_read_image_stream', new=AsyncMock(return_value=b'validated image')),
+            patch.object(main, 'decode_qr_from_bytes', return_value=('https://example.com', 'URL', 'opencv')),
+            patch.object(main, 'get_analyzable_url', return_value='https://example.com'),
+            patch.object(main, 'run_url_analysis', return_value={
+                'model_prediction': 'Legitimate',
+                'prediction_confidence': 0.9,
+            }),
+        ):
+            response = self.client.post(
+                '/api/analyze',
+                files={'file': ('qr.png', b'test qr image bytes', 'image/png')},
+                data={'image_model_name': 'improved_cnn'},
+            )
+        self.assertEqual(response.status_code, 200)
+        result = response.json()
+        self.assertEqual(result['image_model_prediction'], 'Phishing')
+        self.assertIsNone(result['image_model_confidence'])
+        self.assertTrue(result['image_model_demo'])
 
     def test_analyze_url_legitimate(self):
         res = self.client.post('/api/analyze-url', json={'url': 'www.google.com'})
@@ -334,6 +656,7 @@ if __name__ == '__main__':
         TestRiskEngine,
         TestModelInferenceAndFalsePositives,
         TestImageUploadHardening,
+        TestImageModelInference,
         TestQRDecoderPayloads,
         TestAPIEndpoints,
     ]:

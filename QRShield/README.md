@@ -30,10 +30,18 @@ QRShield/
 │   ├── random_forest_url.pkl Random Forest candidate
 │   ├── feature_names.pkl     Ordered 30-feature list
 │   └── image_model.pkl       Selected image classifier
+│   ├── extra_trees_image.pkl Image Extra Trees classifier
+│   ├── random_forest_image.pkl Image Random Forest classifier
+│   └── QR_Phishing_Residual_CNN.keras Residual CNN (inference gated pending preprocessing/label verification)
 ├── results/           Genuine evaluation metrics, confusion matrices, ROC curves
 ├── test_qrshield.py   Automated unit and integration test suite (30 tests)
 ├── test_api.py        Live server endpoint verification script
 ├── requirements.txt   Python dependencies
+├── cnn_service/       Remote CNN inference service scaffold (disabled until verified)
+│   ├── main.py
+│   ├── requirements.txt
+│   └── Dockerfile
+├── requirements-cnn.txt  TensorFlow/Keras dependencies for the remote runtime only
 └── README.md
 ```
 
@@ -41,16 +49,55 @@ QRShield/
 
 ## Quick Start Commands
 
-### 1. Install Dependencies
-```cmd
-cd e:\cybersecurity-project\QRShield
-pip install -r requirements.txt
+### 1. Open in VS Code and Select Python
+Open the repository root folder in VS Code, then select the existing virtual environment:
+
+1. Open the Command Palette (`Ctrl+Shift+P`).
+2. Run **Python: Select Interpreter**.
+3. Select `.venv\Scripts\python.exe`.
+
+From a PowerShell terminal opened at the repository root:
+
+```powershell
+cd QRShield
+..\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-### 2. Train the URL Model (Validation-Guided Selection & Retraining)
-```cmd
-python training\train_url_model.py
+### 2. Start the Local Application
+From the `QRShield` directory:
+
+```powershell
+..\.venv\Scripts\python.exe -m uvicorn backend.main:app --host 127.0.0.1 --port 8000 --reload
 ```
+
+Open **http://127.0.0.1:8000** in your browser. The URL and QR analysis endpoints use the existing saved models; you do not need to train them to run the app.
+
+### 3. Run the Automated Tests
+In a second terminal, from the `QRShield` directory:
+
+```powershell
+..\.venv\Scripts\python.exe test_qrshield.py
+..\.venv\Scripts\python.exe test_api.py
+```
+
+`test_api.py` checks the live server and therefore requires the server from step 2 to be running.
+
+### Image Model Selection and CNN Compatibility
+The Scanner page lets you select Extra Trees or Random Forest for an additional QR-image prediction. The QR is still decoded and URL-analyzed separately. Image models use grayscale 69×69 pixels, float32 values scaled to [0, 1], and the documented label mapping `0 = Benign`, `1 = Phishing`. Uploads that are not already 69×69 are converted to grayscale and resized with Pillow's bilinear resampler before scaling; the training code stores 69×69 inputs and documents scaling but does not specify an upload resize filter.
+
+The Residual CNN expects a `(69, 69, 1)` float32 input and returns one sigmoid score. The training notebook converts the existing grayscale images to float32, scales/clips pixels to `[0, 1]`, and adds the channel dimension. For uploaded images, QRShield converts to grayscale and resizes to 69×69 with Pillow bilinear resampling before scaling; that upload resize choice is experimental because the notebook assumes the dataset images are already 69×69. The notebook selects threshold `0.05` on validation data to target at least 90% phishing recall, choosing the best precision/F1 among eligible thresholds. Label `1` is interpreted as Phishing according to the QR dataset documentation.
+
+The local backend has a Residual CNN inference path that loads the existing `.keras` file lazily, validates its input/output shapes, and keeps model results marked **EXPERIMENTAL**. If a compatible local runtime is unavailable, the Scanner returns a fixed `Phishing` **demo-only** label with no confidence; this is not a model prediction and does not depend on the uploaded image. It does not retrain the model or send images externally. The runtime pins are listed in `requirements-cnn.txt` (TensorFlow 2.20.0, Keras 3.13.2); the backend reports the reason actual inference is unavailable. No packages are installed by this project automatically.
+
+To check local CNN readiness, start the website and open `/health`. The response includes `cnn_prediction_enabled` and `cnn_status_reason`. Extra Trees, Random Forest, and URL analysis continue to use their existing code paths. The `cnn_service` folder remains an unused remote-service scaffold; local inference does not call or deploy it.
+
+### Optional: Retrain the URL Model
+Training is not needed for normal use. It writes new model and evaluation files into `models/` and `results/`, so skip it to preserve the existing evaluated model and reported results.
+
+```powershell
+..\.venv\Scripts\python.exe training\train_url_model.py
+```
+
 This script:
 - Verifies label mapping (`0 = Legitimate`, `1 = Phishing`).
 - De-biases synthetic artifacts (apex domains, subdomains, benign paths).
@@ -58,19 +105,6 @@ This script:
 - Evaluates Extra Trees and Random Forest on the Validation set and selects the superior model.
 - Retrains the selected model on Train + Validation combined.
 - Evaluates once on the untouched Test set and saves genuine metrics/charts to `results/`.
-
-### 3. Run the Automated Test Suites
-```cmd
-python test_qrshield.py
-python test_api.py
-```
-
-### 4. Start the Web Server (Localhost Default)
-```cmd
-cd backend
-uvicorn main:app --host 127.0.0.1 --port 8000
-```
-Open your browser at: **http://127.0.0.1:8000**
 
 ---
 
